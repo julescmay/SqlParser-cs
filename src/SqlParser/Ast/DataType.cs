@@ -1033,6 +1033,20 @@ public abstract record DataType : IWriteSql, IElement
         }
     }
     /// <summary>
+    /// Multiple types specified - only used with SQLite
+    /// </summary>
+    public record Composite : DataType {
+        List<DataType> elements = new();
+
+        public Composite Add (DataType that) {
+            elements.Add(that);
+            return this;
+        }
+        public override void ToSql(SqlTextWriter writer) {
+            foreach (var e in elements) writer.WriteSql($" {e}");
+        }
+    }
+    /// <summary>
     /// UUID data ype
     /// </summary>
     public record Uuid : DataType

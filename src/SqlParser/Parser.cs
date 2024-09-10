@@ -4632,7 +4632,20 @@ public partial class Parser
     public ColumnDef ParseColumnDef()
     {
         var name = ParseIdentifier();
-        var dataType = IsUnspecified() ? new DataType.Unspecified() : ParseDataType();
+        DataType dataType;
+        if (_dialect is SQLiteDialect) {
+            dataType = new DataType.Unspecified();
+            while (!IsUnspecified()) {
+                dataType = dataType switch {
+                    DataType.Unspecified _ => ParseDataType(),
+                    DataType.Composite dt => dt.Add (ParseDataType()),
+                    _ => new DataType.Composite().Add (dataType).Add (ParseDataType())
+                };
+            }
+        }
+        else {
+            dataType = ParseDataType();
+        }
         var collation = ParseInit(ParseKeyword(Keyword.COLLATE), ParseObjectName);
         Sequence<ColumnOptionDef>? options = null;
 
