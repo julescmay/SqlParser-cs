@@ -1065,6 +1065,17 @@ public abstract record DataType : IWriteSql, IElement
             FormatCharacterStringType(writer, "VARCHAR", IntegerLength);
         }
     }
+    /// <summary>
+    /// Any strange datatype that's been made-up by SQLite
+    /// </summary>
+    public record SQLiteStringType (string typeDefn) : DataType
+    {
+        public override void ToSql(SqlTextWriter writer) {
+            writer.Write(typeDefn);
+        }
+    }
+
+    /// <param name="writer"></param>
 
     public abstract void ToSql(SqlTextWriter writer);
 }
