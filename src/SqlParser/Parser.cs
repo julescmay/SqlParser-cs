@@ -6110,6 +6110,7 @@ public partial class Parser
                 new DataType.Nested(ParseCommaSeparated(ParseColumnDef))),
 
             Word { Keyword: Keyword.TUPLE } when _dialect is ClickHouseDialect or GenericDialect => ParseClickhouseTuple(),
+            SingleQuotedString s when _dialect is SQLiteDialect => new DataType.SQLiteStringType(s.Value),
             _ => ParseUnmatched()
         };
 
