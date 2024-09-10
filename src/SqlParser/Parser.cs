@@ -4690,6 +4690,10 @@ public partial class Parser
                     or Keyword.AS;
             }
 
+            if (PeekToken() is SingleQuotedString) {
+                return false;
+            }
+
             return true;
         }
     }
