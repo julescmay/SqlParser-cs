@@ -32,7 +32,7 @@ public class ClickhouseDialectTests : ParserTestBase
             [
                 new(new Expression.Function("indexOf")
                 {
-                    Args = new FunctionArguments.List(new FunctionArgumentList(null, args, null))
+                    Args = new FunctionArguments.List(new FunctionArgumentList(Args: args))
                 },
                 MapAccessSyntax.Bracket)
             ]))
@@ -56,7 +56,7 @@ public class ClickhouseDialectTests : ParserTestBase
                     [
                         new Expression.MapAccessKey(new Expression.Function("indexOf")
                         {
-                            Args = new FunctionArguments.List(new FunctionArgumentList(null, selectionArgs, null))
+                            Args = new FunctionArguments.List(new FunctionArgumentList(selectionArgs))
 
                         }, MapAccessSyntax.Bracket)
 
@@ -96,7 +96,7 @@ public class ClickhouseDialectTests : ParserTestBase
 
         var expected = new Expression.Function("array")
         {
-            Args = new FunctionArguments.List(new FunctionArgumentList(null, args, null))
+            Args = new FunctionArguments.List(new FunctionArgumentList(args))
         };
 
         Assert.Equal(expected, select.Projection.First().AsExpr());
@@ -354,9 +354,9 @@ public class ClickhouseDialectTests : ParserTestBase
         {
             Assert.Equal(new ObjectName(new Ident(name)), actual.Name);
             Assert.Equal(
-                new FunctionArguments.List(new FunctionArgumentList(null, [
+                new FunctionArguments.List(new FunctionArgumentList([
                     new FunctionArg.Unnamed(new FunctionArgExpression.FunctionExpression(new Expression.Identifier(new Ident(arg))))
-                ], null)),
+                ])),
                 actual.Args);
         }
     }
@@ -383,14 +383,14 @@ public class ClickhouseDialectTests : ParserTestBase
 
         var expected = new SelectItem.UnnamedExpression(new Expression.Function("HISTOGRAM")
         {
-            Args = new FunctionArguments.List(new FunctionArgumentList(null, [
+            Args = new FunctionArguments.List(new FunctionArgumentList([
                 new FunctionArg.Unnamed(new FunctionArgExpression.FunctionExpression(new Expression.Identifier("x"))),
                 new FunctionArg.Unnamed(new FunctionArgExpression.FunctionExpression(new Expression.Identifier("y"))),
-            ], null)),
-            Parameters = new FunctionArguments.List(new FunctionArgumentList(null, [
+            ])),
+            Parameters = new FunctionArguments.List(new FunctionArgumentList([
                 new FunctionArg.Unnamed(new FunctionArgExpression.FunctionExpression(new Expression.LiteralValue(new Value.Number("0.5")))),
                 new FunctionArg.Unnamed(new FunctionArgExpression.FunctionExpression(new Expression.LiteralValue(new Value.Number("0.6"))))
-            ], null))
+            ]))
         });
         Assert.Equal(expected, projection[0]);
     }
@@ -681,5 +681,52 @@ public class ClickhouseDialectTests : ParserTestBase
         const string sql = "SELECT fname FROM customer ORDER BY fname WITH FILL INTERPOLATE ()";
         var select = VerifiedQuery(sql, DefaultDialects!);
         Assert.Equal(new Interpolate([]), select.OrderBy!.Interpolate);
+    }
+
+    [Fact]
+    public void Parse_Create_Table_With_Variant_Default_Expressions()
+    {
+        const string sql = """
+                  CREATE TABLE table (
+                  a DATETIME MATERIALIZED now(), 
+                  b DATETIME EPHEMERAL now(), 
+                  c DATETIME EPHEMERAL, 
+                  d STRING ALIAS toString(c)
+                  ) ENGINE=MergeTree
+                  """;
+
+        var create = VerifiedStatement<Statement.CreateTable>(sql);
+
+        var expected = new Sequence<ColumnDef>
+        {
+            new ("a", new DataType.Datetime(), Options:[
+                    new ColumnOptionDef(new ColumnOption.Materialized(new Expression.Function("now")
+                    {
+                        Args = new FunctionArguments.List(new FunctionArgumentList())
+                    }))
+                ]),
+
+            new ("b", new DataType.Datetime(), Options:[
+                    new ColumnOptionDef(new ColumnOption.Ephemeral(new Expression.Function("now")
+                    {
+                        Args = new FunctionArguments.List(new FunctionArgumentList())
+                    }))
+                ]),
+
+            new("c", new DataType.Datetime(), Options:[
+                new ColumnOptionDef(new ColumnOption.Ephemeral())
+                ]),
+
+            new("d", new DataType.StringType(), Options:[
+                new ColumnOptionDef(new ColumnOption.Alias(new Expression.Function("toString")
+                {
+                    Args = new FunctionArguments.List(new FunctionArgumentList(Args: [
+                        new FunctionArg.Unnamed(new FunctionArgExpression.FunctionExpression(new Expression.Identifier("c")))
+                    ]))
+                }))
+            ]),
+        };
+
+        Assert.Equal(expected, create.Element.Columns);
     }
 }

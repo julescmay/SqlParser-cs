@@ -15,7 +15,6 @@ using Select = SqlParser.Ast.Select;
 using Declare = SqlParser.Ast.Declare;
 using HiveRowDelimiter = SqlParser.Ast.HiveRowDelimiter;
 using Subscript = SqlParser.Ast.Subscript;
-using System.Data;
 
 namespace SqlParser;
 
@@ -882,20 +881,29 @@ public partial class Parser
             });
         }
 
-        Position ParsePositionExpr()
+        Expression ParsePositionExpr(Ident ident)
         {
-            ExpectLeftParen();
-
-            var expr = ParseSubExpression(BetweenPrecedence);
-
-            if (ParseKeyword(Keyword.IN))
+            var positionExpression = MaybeParse(() =>
             {
+                ExpectLeftParen();
+
+                var expr = ParseSubExpression(BetweenPrecedence);
+
+                ExpectKeyword(Keyword.IN);
+
                 var from = ParseExpr();
                 ExpectRightParen();
+
                 return new Position(expr, from);
+            });
+           
+
+            if (positionExpression != null)
+            {
+                return positionExpression;
             }
 
-            throw new ParserException("Position function must include IN keyword");
+            return ParseFunction(new ObjectName(ident));
         }
 
         Substring ParseSubstringExpr()
@@ -1102,6 +1110,25 @@ public partial class Parser
             return new Prior(ParseSubExpression(PlusMinusPrecedence));
         }
 
+        Expression ParseDuckDbMapLiteral()
+        {
+            ExpectToken<LeftBrace>();
+            var fields = ParseCommaSeparated(ParseDuckDbMapField);
+            ExpectToken<RightBrace>();
+            return new Expression.Map(new Ast.Map(fields));
+        }
+
+        MapEntry ParseDuckDbMapField()
+        {
+            var key = ParseExpr();
+
+            ExpectToken<Colon>();
+
+            var value = ParseExpr();
+
+            return new MapEntry(key, value);
+        }
+
         Expression ParseBigQueryStructLiteral()
         {
             //var (fields, trailingBracket) = ParseStructTypeDef(ParseBigQueryStructFieldDef);
@@ -1276,7 +1303,7 @@ public partial class Parser
             Word { Keyword: Keyword.EXTRACT } => ParseExtractExpr(),
             Word { Keyword: Keyword.CEIL } => ParseCeilFloorExpr(true),
             Word { Keyword: Keyword.FLOOR } => ParseCeilFloorExpr(false),
-            Word { Keyword: Keyword.POSITION } when PeekToken() is LeftParen => ParsePositionExpr(),
+            Word { Keyword: Keyword.POSITION } p when PeekToken() is LeftParen => ParsePositionExpr(p.ToIdent()),
             Word { Keyword: Keyword.SUBSTRING } => ParseSubstringExpr(),
             Word { Keyword: Keyword.OVERLAY } => ParseOverlayExpr(),
             Word { Keyword: Keyword.TRIM } => ParseTrimExpr(),
@@ -1292,6 +1319,7 @@ public partial class Parser
             Word { Keyword: Keyword.MATCH } when _dialect is MySqlDialect or GenericDialect => ParseMatchAgainst(),
             Word { Keyword: Keyword.STRUCT } when _dialect is BigQueryDialect or GenericDialect => ParseStruct(),
             Word { Keyword: Keyword.PRIOR } when _parserState == ParserState.ConnectBy => ParseConnectByExpression(),
+            Word { Keyword: Keyword.MAP } when _dialect.SupportMapLiteralSyntax && PeekTokenIs<LeftBrace>() => ParseDuckDbMapLiteral(),
             //  
             // Here `word` is a word, check if it's a part of a multipart
             // identifier, a function call, or a simple identifier
@@ -1327,6 +1355,7 @@ public partial class Parser
                 or RawStringLiteral
                 or NationalStringLiteral
                 or HexStringLiteral
+                or UnicodeStringLiteral
                 => ParseTokenValue(),
 
             LeftParen => ParseLeftParen(),
@@ -1684,7 +1713,7 @@ public partial class Parser
 
         ExpectToken<RightParen>();
 
-        return new FunctionArgumentList(duplicateTreatment, args, clauses);
+        return new FunctionArgumentList(args, duplicateTreatment, clauses);
     }
 
     public ListAggOnOverflow? ParseListAggOnOverflow()
@@ -1712,6 +1741,7 @@ public partial class Parser
             else if (token
                      is SingleQuotedString
                      or EscapedStringLiteral
+                     or UnicodeStringLiteral
                      or NationalStringLiteral
                      or HexStringLiteral)
             {
@@ -2007,9 +2037,19 @@ public partial class Parser
                 return CreateGroupExpr(true, true, e => new Cube(e));
             }
 
-            return ParseKeyword(Keyword.ROLLUP)
-                ? CreateGroupExpr(true, true, e => new Rollup(e))
-                : ParseExpr();
+            if (ParseKeyword(Keyword.ROLLUP))
+            {
+                return CreateGroupExpr(true, true, e => new Rollup(e));
+            }
+
+            if (ConsumeTokens(typeof(LeftParen), typeof(RightParen)))
+            {
+                // PostgreSQL allow to use empty tuple as a group by expression,
+                // e.g. `GROUP BY (), name`. Please refer to GROUP BY Clause section in
+                return new Expression.Tuple([]);
+            }
+
+            return ParseExpr();
         }
 
         return ParseExpr();
@@ -4601,12 +4641,10 @@ public partial class Parser
             if (ParseAnyOptionalTableConstraints(constraint => constraints.Add(constraint))) {
                 // work has been done already
             }
-            else if ((PeekToken() is Word) || (PeekToken() is SingleQuotedString))
-            {
+            else if (PeekToken() is Word) {
                 columns.Add(ParseColumnDef());
             }
-            else 
-            {
+            else {
                 ThrowExpected("column name or constraint definition", PeekToken());
             }
 
@@ -4750,6 +4788,29 @@ public partial class Parser
             return new ColumnOption.Default(ParseExpr());
         }
 
+        if (_dialect is ClickHouseDialect or GenericDialect && ParseKeyword(Keyword.MATERIALIZED))
+        {
+            return new ColumnOption.Materialized(ParseExpr());
+        }
+
+        if (_dialect is ClickHouseDialect or GenericDialect && ParseKeyword(Keyword.ALIAS))
+        {
+            return new ColumnOption.Alias(ParseExpr());
+        }
+
+        if (_dialect is ClickHouseDialect or GenericDialect && ParseKeyword(Keyword.EPHEMERAL))
+        {
+            var next = PeekToken();
+
+            if (next is Comma or RightParen)
+            {
+                return new ColumnOption.Ephemeral();
+            }
+
+            return new ColumnOption.Ephemeral(ParseExpr());
+
+        }
+
         if (ParseKeywordSequence(Keyword.PRIMARY, Keyword.KEY))
         {
             var order = _dialect is SQLiteDialect ? ParseOneOfKeywords([Keyword.ASC, Keyword.DESC]) : Keyword.undefined;
@@ -4766,7 +4827,7 @@ public partial class Parser
 
         if (ParseKeyword(Keyword.UNIQUE))
         {
-            var conflict = _dialect is SQLiteDialect ? ParseColumnConflictClause() : Keyword.undefined;
+            var conflict = _dialect is SQLiteDialect ? ParseColumnConflictClause() : null;
             var characteristics = ParseConstraintCharacteristics();
             return new ColumnOption.Unique(false)
             {
@@ -5988,6 +6049,9 @@ public partial class Parser
             case EscapedStringLiteral e:
                 return new Value.EscapedStringLiteral(e.Value);
 
+            case UnicodeStringLiteral u:
+                return new Value.UnicodeStringLiteral(u.Value);
+
             case HexStringLiteral h:
                 return new Value.HexStringLiteral(h.Value);
 
@@ -7075,7 +7139,7 @@ public partial class Parser
                 DescribeAlias = describeAlias,
                 Analyze = analyze,
                 Verbose = verbose,
-                Format = format,
+                Format = format
             },
             _ => ParseDescribeFormat()
         };
@@ -7104,6 +7168,9 @@ public partial class Parser
         {
             HiveDescribeFormat? hiveFormat = null;
             var kwd = ParseOneOfKeywords(Keyword.EXTENDED, Keyword.FORMATTED);
+            var hasTableKeyword = ParseKeyword(Keyword.TABLE);
+            var tableName = ParseObjectName();
+
             switch (kwd)
             {
                 case Keyword.EXTENDED:
@@ -7115,7 +7182,7 @@ public partial class Parser
                     break;
             }
 
-            return new ExplainTable(describeAlias, ParseObjectName(), hiveFormat);
+            return new ExplainTable(describeAlias, tableName, hiveFormat, hasTableKeyword);
         }
     }
 
@@ -7949,6 +8016,8 @@ public partial class Parser
 
         while (true)
         {
+            var @global = ParseKeyword(Keyword.GLOBAL);
+
             Join join;
             if (ParseKeyword(Keyword.CROSS))
             {
@@ -7970,7 +8039,8 @@ public partial class Parser
                 join = new Join
                 {
                     Relation = ParseTableFactor(),
-                    JoinOperator = joinOperator
+                    JoinOperator = joinOperator,
+                    Global = @global
                 };
             }
             else if (ParseKeyword(Keyword.OUTER))
@@ -7979,7 +8049,8 @@ public partial class Parser
                 join = new Join
                 {
                     Relation = ParseTableFactor(),
-                    JoinOperator = new JoinOperator.OuterApply()
+                    JoinOperator = new JoinOperator.OuterApply(),
+                    Global = @global
                 };
             }
             else if (ParseKeyword(Keyword.ASOF))
@@ -7989,7 +8060,7 @@ public partial class Parser
                 var asOfRelation = ParseTableFactor();
                 ExpectKeyword(Keyword.MATCH_CONDITION);
                 var matchCondition = ExpectParens(ParseExpr);
-                join = new Join(asOfRelation, new JoinOperator.AsOf(matchCondition, ParseJoinConstraint(false)));
+                join = new Join(asOfRelation, new JoinOperator.AsOf(matchCondition, ParseJoinConstraint(false)), @global);
             }
             else
             {
@@ -8074,7 +8145,8 @@ public partial class Parser
                 join = new Join
                 {
                     Relation = rel,
-                    JoinOperator = joinAction(joniConstraint)
+                    JoinOperator = joinAction(joniConstraint),
+                    Global = @global
                 };
             }
 

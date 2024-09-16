@@ -103,6 +103,7 @@ internal static class Keywords
         Keyword.USING,
         Keyword.CLUSTER,
         Keyword.DISTRIBUTE,
+        Keyword.GLOBAL,
         // for MSSQL-specific OUTER APPLY (seems reserved in most dialects)
         Keyword.OUTER,
         Keyword.SET,
@@ -137,6 +138,7 @@ public enum Keyword
     AFTER,
     AGAINST,
     AGGREGATION,
+    ALIAS,
     ALL,
     ALLOCATE,
     ALTER,
@@ -322,6 +324,7 @@ public enum Keyword
     ENDPOINT,
     ENGINE,
     ENUM,
+    EPHEMERAL,
     EPOCH,
     EQUALS,
     ERROR,
