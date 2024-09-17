@@ -5181,11 +5181,13 @@ public partial class Parser
                 // Optional constraint name
                 var identName = MaybeParse(ParseIdentifier) ?? name;
                 var columns = ParseParenthesizedColumnList(IsOptional.Mandatory, false);
+                var conflict = _dialect is SQLiteDialect ? ParseSQLiteConflictClause() : null;
                 var characteristics = ParseConstraintCharacteristics();
                 return new TableConstraint.Unique(columns)
                 {
                     Name = identName,
                     IsPrimaryKey = isPrimary,
+                    Conflict = conflict,
                     Characteristics = characteristics
                 };
             }
