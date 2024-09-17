@@ -1,4 +1,5 @@
-﻿using System.Text.RegularExpressions;
+﻿using System.Diagnostics;
+using System.Text.RegularExpressions;
 using SqlParser.Ast;
 using SqlParser.Dialects;
 using SqlParser.Tokens;
@@ -40,8 +41,6 @@ public partial class Parser
     public const short MulDivModOpPrecedence = 40;
     public const short AtTimeZonePrecedence = 41;
     public const short PlusMinusPrecedence = 30;
-
-    //public const short MultiplyPrecedence = 40;
     public const short ArrowPrecedence = 50;
 
     private int _index;
@@ -243,9 +242,49 @@ public partial class Parser
             Keyword.INSTALL when _dialect is DuckDbDialect or GenericDialect => ParseInstall(),
             // `LOAD` is DuckDb specific https://duckdb.org/docs/extensions/overview
             Keyword.LOAD when _dialect is DuckDbDialect or GenericDialect => ParseLoad(),
+            Keyword.OPTIMIZE when _dialect is ClickHouseDialect or GenericDialect => ParseOptimizeTable(),
 
             _ => throw Expected("a SQL statement", PeekToken())
         };
+    }
+
+    public OptimizeTable ParseOptimizeTable()
+    {
+        ExpectKeyword(Keyword.TABLE);
+
+        var name = ParseObjectName();
+        var onCluster = ParseOptionalOnCluster();
+
+        Partition? partition = null;
+
+        if (ParseKeyword(Keyword.PARTITION))
+        {
+            if (ParseKeywordSequence(Keyword.ID))
+            {
+                partition = new Partition.Identifier(ParseIdentifier());
+            }
+            else
+            {
+                partition = new Partition.Expr(ParseExpr());
+            }
+        }
+
+        var includeFinal = ParseKeyword(Keyword.FINAL);
+        Deduplicate? deduplicate = null;
+
+        if (ParseKeyword(Keyword.DEDUPLICATE))
+        {
+            if (ParseKeyword(Keyword.BY))
+            {
+                deduplicate = new Deduplicate.ByExpression(ParseExpr());
+            }
+            else
+            {
+                deduplicate = new Deduplicate.All();
+            }
+        }
+
+        return new OptimizeTable(name, onCluster, partition, includeFinal, deduplicate);
     }
 
     public Statement ParseFlush()
@@ -883,11 +922,12 @@ public partial class Parser
 
         Expression ParsePositionExpr(Ident ident)
         {
+            var betweenPrec = _dialect.GetBetweenPrecedence();
             var positionExpression = MaybeParse(() =>
             {
                 ExpectLeftParen();
 
-                var expr = ParseSubExpression(BetweenPrecedence);
+                var expr = ParseSubExpression(betweenPrec);
 
                 ExpectKeyword(Keyword.IN);
 
@@ -1219,13 +1259,7 @@ public partial class Parser
 
         Expression.Array ParseArrayExpr(bool named)
         {
-            if (PeekToken() is RightBracket)
-            {
-                NextToken();
-                return new Expression.Array(new ArrayExpression(new Sequence<Expression>(), named));
-            }
-
-            var expressions = ParseCommaSeparated(ParseExpr);
+            var expressions = ParseCommaSeparated0(ParseExpr, typeof(RightBracket));
             ExpectToken<RightBracket>();
             return new Expression.Array(new ArrayExpression(expressions, named));
         }
@@ -4410,18 +4444,7 @@ public partial class Parser
         var ifNotExists = ParseIfNotExists();
         var tableName = ParseObjectName(allowUnquotedHyphen);
 
-        // Clickhouse has `ON CLUSTER 'cluster'` syntax for DDLs
-        string? onCluster = null;
-        if (ParseKeywordSequence(Keyword.ON, Keyword.CLUSTER))
-        {
-            var token = NextToken();
-            onCluster = token switch
-            {
-                SingleQuotedString s => s.Value,
-                Word w => w.Value,
-                _ => throw Expected("identifier or cluster literal", token)
-            };
-        }
+        var onCluster = ParseOptionalOnCluster();
 
         var like = ParseInit<ObjectName?>(ParseKeyword(Keyword.LIKE) || ParseKeyword(Keyword.ILIKE), () => ParseObjectName(allowUnquotedHyphen));
 
@@ -4597,6 +4620,17 @@ public partial class Parser
             ClusterBy = createTableConfig.ClusterBy,
             Options = createTableConfig.Options
         };
+    }
+
+    private Ident? ParseOptionalOnCluster()
+    {
+        string? onCluster = null;
+        if (ParseKeywordSequence(Keyword.ON, Keyword.CLUSTER))
+        {
+            return ParseIdentifier();
+        }
+
+        return null;
     }
 
     public CreateTableConfiguration ParseOptionalCreateTableConfig()
@@ -5100,14 +5134,14 @@ public partial class Parser
     bool ParseAnyOptionalTableConstraints(Action<TableConstraint> action) {
         bool any = false;
         while (true) {
-            var constraint = ParseOptionalTableConstraint(any);
+            var constraint = ParseOptionalTableConstraint(any, false);
             if (constraint == null) return any;
             action(constraint);
             any = true;
         }
     }
 
-    public TableConstraint? ParseOptionalTableConstraint(bool isSubsequentConstraint = false)
+    public TableConstraint? ParseOptionalTableConstraint(bool isSubsequentConstraint, bool isAlterTable)
     {
         var name = isSubsequentConstraint ? null : ParseInit(ParseKeyword(Keyword.CONSTRAINT), ParseIdentifier);
 
@@ -5130,19 +5164,31 @@ public partial class Parser
             var isPrimary = word.Keyword == Keyword.PRIMARY;
             ParseKeyword(Keyword.KEY);
 
-            // Optional constraint name
-            var identName = MaybeParse(ParseIdentifier) ?? name;
+            if (_dialect is PostgreSqlDialect && isAlterTable && PeekToken() is Word { Keyword: Keyword.USING })
+            {
+                ParseKeywordSequence(Keyword.USING, Keyword.INDEX);
+                var indexName = ParseIdentifier();
+                var characteristics = ParseConstraintCharacteristics();
 
-            var columns = ParseParenthesizedColumnList(IsOptional.Mandatory, false);
-            var conflict = _dialect is SQLiteDialect ? ParseSQLiteConflictClause() : null;
-            var characteristics = ParseConstraintCharacteristics();
-
-            return new TableConstraint.Unique(columns) {
-                Name = identName,
-                IsPrimaryKey = isPrimary,
-                Conflict = conflict,
-                Characteristics = characteristics
-            };
+                return new TableConstraint.PostgresAlterTableIndex(name, indexName)
+                {
+                    Characteristics = characteristics,
+                    IsPrimaryKey = isPrimary
+                };
+            }
+            else
+            {
+                // Optional constraint name
+                var identName = MaybeParse(ParseIdentifier) ?? name;
+                var columns = ParseParenthesizedColumnList(IsOptional.Mandatory, false);
+                var characteristics = ParseConstraintCharacteristics();
+                return new TableConstraint.Unique(columns)
+                {
+                    Name = identName,
+                    IsPrimaryKey = isPrimary,
+                    Characteristics = characteristics
+                };
+            }
         }
 
         TableConstraint ParseForeign()
@@ -5313,6 +5359,7 @@ public partial class Parser
                     var ifExists = ParseIfExists();
                     var only = ParseKeyword(Keyword.ONLY);
                     var tableName = ParseObjectName();
+                    var onCluster = ParseOptionalOnCluster();
                     var operations = ParseCommaSeparated(ParseAlterTableOperation);
 
                     HiveSetLocation? location = null;
@@ -5326,7 +5373,7 @@ public partial class Parser
                         location = new HiveSetLocation(true, ParseIdentifier());
                     }
 
-                    return new AlterTable(tableName, ifExists, only, operations, location);
+                    return new AlterTable(tableName, ifExists, only, operations, location, onCluster);
                 }
 
             case Keyword.INDEX:
@@ -5408,7 +5455,7 @@ public partial class Parser
 
         if (ParseKeyword(Keyword.ADD))
         {
-            var constraint = ParseOptionalTableConstraint();
+            var constraint = ParseOptionalTableConstraint(false, true);
             if (constraint != null)
             {
                 operation = new AddConstraint(constraint);
@@ -5424,7 +5471,7 @@ public partial class Parser
                     if (ParseKeyword(Keyword.PARTITION))
                     {
                         var partition = ExpectParens(() => ParseCommaSeparated(ParseExpr));
-                        newPartitions.Add(new Partition(partition));
+                        newPartitions.Add(new Partition.Partitions(partition));
                     }
                     else
                     {
@@ -5679,6 +5726,14 @@ public partial class Parser
             ExpectKeyword(Keyword.WITH);
             operation = new SwapWith(ParseObjectName());
         }
+        else if (_dialect is ClickHouseDialect or GenericDialect && ParseKeyword(Keyword.ATTACH))
+        {
+            return new AttachPartition(ParsePartOrPartition());
+        }
+        else if (_dialect is ClickHouseDialect or GenericDialect && ParseKeyword(Keyword.DETACH))
+        {
+            return new DetachPartition(ParsePartOrPartition());
+        }
         else if (_dialect is PostgreSqlDialect or GenericDialect && ParseKeywordSequence(Keyword.OWNER, Keyword.TO))
         {
             var keyword = ParseOneOfKeywords(Keyword.CURRENT_USER, Keyword.CURRENT_ROLE, Keyword.SESSION_USER);
@@ -5699,6 +5754,18 @@ public partial class Parser
         }
 
         return operation;
+    }
+
+    private Partition ParsePartOrPartition()
+    {
+        var keyword = ExpectOneOfKeywords(Keyword.PART, Keyword.PARTITION);
+
+        return keyword switch
+        {
+            Keyword.PART => new Partition.Part(ParseExpr()),
+            Keyword.PARTITION => new Partition.Expr(ParseExpr()),
+            _ => throw new UnreachableException()
+        };
     }
 
     private MySqlColumnPosition? ParseColumnPosition()
@@ -7400,8 +7467,6 @@ public partial class Parser
         }
 
         return ParseRemainingSetExpressions(expr, precedence);
-
-
     }
 
     private SetExpression ParseRemainingSetExpressions(SetExpression expr, int precedence)
@@ -8374,7 +8439,8 @@ public partial class Parser
         var version = ParseTableVersion();
 
         // Postgres, MSSQL: table-valued functions:
-        var args = ParseInit(ConsumeToken<LeftParen>(), ParseOptionalArgs);
+        var args = ParseInit(ConsumeToken<LeftParen>(), ParseTableFunctionArgs);
+
         var ordinality = ParseKeywordSequence(Keyword.WITH, Keyword.ORDINALITY);
         var optionalAlias = ParseOptionalTableAlias(Keywords.ReservedForTableAlias);
 
@@ -8419,6 +8485,36 @@ public partial class Parser
         }
 
         return table;
+    }
+
+    private TableFunctionArgs ParseTableFunctionArgs()
+    {
+        if (ConsumeToken<RightParen>())
+        {
+            return new TableFunctionArgs([]);
+        }
+
+        var args = new Sequence<FunctionArg>();
+        Sequence<Setting>? settings = null;
+
+        while (true)
+        {
+            settings = ParseSettings();
+
+            if (settings != null)
+            {
+                break;
+            }
+
+            args.Add(ParseFunctionArgs());
+            if (IsParseCommaSeparatedEnd())
+            {
+                break;
+            }
+        }
+
+        ExpectRightParen();
+        return new TableFunctionArgs(args, settings);
     }
 
     public TableFactor ParseMatchRecognize(TableFactor table)
